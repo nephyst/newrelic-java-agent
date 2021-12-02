@@ -9,22 +9,27 @@ package com.nr.instrumentation.kafka;
 
 import com.newrelic.agent.bridge.AgentBridge;
 import com.newrelic.api.agent.NewRelic;
+import org.apache.kafka.common.ClusterResource;
+import org.apache.kafka.common.ClusterResourceListener;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.MetricsReporter;
 
 import java.util.ConcurrentModificationException;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 
-public class NewRelicMetricsReporter implements MetricsReporter {
+public class NewRelicMetricsReporter implements MetricsReporter, ClusterResourceListener {
 
     private static final boolean kafkaMetricsDebug = NewRelic.getAgent().getConfig().getValue("kafka.metrics.debug.enabled", false);
 
@@ -34,7 +39,9 @@ public class NewRelicMetricsReporter implements MetricsReporter {
 
     private final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, buildThreadFactory("NewRelicMetricsReporter-%d"));
 
-    private final Map<String, KafkaMetric> metrics = new ConcurrentHashMap<>();
+    private final Map<String, KafkaMetric> clusterClientEvents = new ConcurrentHashMap<>();
+
+    private final AtomicReference<String> clusterId = new AtomicReference<>(null);
 
     @Override
     public void init(final List<KafkaMetric> initMetrics) {
@@ -43,7 +50,8 @@ public class NewRelicMetricsReporter implements MetricsReporter {
             if (kafkaMetricsDebug) {
                 AgentBridge.getAgent().getLogger().log(Level.FINEST, "init(): {0} = {1}", metricGroupAndName, kafkaMetric.metricName());
             }
-            metrics.put(metricGroupAndName, kafkaMetric);
+            clusterClientEvents.put(metricGroupAndName, kafkaMetric);
+            extractClientEvent(kafkaMetric);
         }
 
         final String metricPrefix = "MessageBroker/Kafka/Internal/";
@@ -52,7 +60,14 @@ public class NewRelicMetricsReporter implements MetricsReporter {
             public void run() {
                 try {
                     Map<String, Object> eventData = new HashMap<>();
-                    for (final Map.Entry<String, KafkaMetric> metric : metrics.entrySet()) {
+                    Set<Map<String, Object>> clusterClientEvents = new HashSet<>();
+                    for (final Map.Entry<String, KafkaMetric> metric : NewRelicMetricsReporter.this.clusterClientEvents.entrySet()) {
+
+                        Map<String, Object> clientEvent = extractClientEvent(metric.getValue());
+                        if (clientEvent != null) {
+                            clusterClientEvents.add(clientEvent);
+                        }
+
                         final float value = Double.valueOf(metric.getValue().value()).floatValue();
                         if (kafkaMetricsDebug) {
                             AgentBridge.getAgent().getLogger().log(Level.FINEST, "getMetric: {0} = {1}", metric.getKey(), value);
@@ -64,6 +79,12 @@ public class NewRelicMetricsReporter implements MetricsReporter {
                                 NewRelic.recordMetric(metricPrefix + metric.getKey(), value);
                             }
                         }
+                    }
+                    for (Map<String, Object> clientEvent : clusterClientEvents) {
+                        if (kafkaMetricsDebug) {
+                            AgentBridge.getAgent().getLogger().log(Level.FINEST, "KafkaClientMetrics {0}", clientEvent);
+                        }
+                        NewRelic.getAgent().getInsights().recordCustomEvent("KafkaClientMetrics", clientEvent);
                     }
 
                     if (metricsAsEvents) {
@@ -86,7 +107,7 @@ public class NewRelicMetricsReporter implements MetricsReporter {
         if (kafkaMetricsDebug) {
             AgentBridge.getAgent().getLogger().log(Level.FINEST, "metricChange(): {0} = {1}", metricGroupAndName, metric.metricName());
         }
-        metrics.put(metricGroupAndName, metric);
+        clusterClientEvents.put(metricGroupAndName, metric);
     }
 
     @Override
@@ -95,7 +116,7 @@ public class NewRelicMetricsReporter implements MetricsReporter {
         if (kafkaMetricsDebug) {
             AgentBridge.getAgent().getLogger().log(Level.FINEST, "metricRemoval(): {0} = {1}", metricGroupAndName, metric.metricName());
         }
-        metrics.remove(metricGroupAndName);
+        clusterClientEvents.remove(metricGroupAndName);
     }
 
     private String getMetricGroupAndName(final KafkaMetric metric) {
@@ -106,10 +127,47 @@ public class NewRelicMetricsReporter implements MetricsReporter {
         return metric.metricName().group() + "/" + metric.metricName().name();
     }
 
+    private Map<String, Object> extractClientEvent(final KafkaMetric metric) {
+        if (clusterId.get() == null) {
+            return null;
+        }
+
+        Map<String, String> tags = metric.metricName().tags();
+        String clientId = tags.get("client-id");
+        String topic = tags.get("topic");
+        String nodeId = tags.get("node-id");
+
+        if (clientId == null || (topic == null && nodeId == null)) {
+            return null;
+        }
+
+        String action = metric.metricName().group().split("-")[0];
+
+        Map<String, Object> event = new HashMap<>();
+        event.put("clusterId", clusterId);
+        event.put("clientId", clientId);
+        event.put("action", action);
+
+        if (topic != null) {
+            event.put("topic", topic);
+        }
+        if (nodeId != null) {
+            event.put("nodeId", nodeId);
+        }
+
+        return event;
+    }
+
+    @Override
+    public void onUpdate(ClusterResource clusterResource) {
+        AgentBridge.getAgent().getLogger().log(Level.FINEST, "onUpdate(ClusterResource): {0}", clusterResource.clusterId());
+        this.clusterId.set(clusterResource.clusterId());
+    }
+
     @Override
     public void close() {
         executor.shutdown();
-        metrics.clear();
+        clusterClientEvents.clear();
     }
 
     @Override
@@ -133,5 +191,4 @@ public class NewRelicMetricsReporter implements MetricsReporter {
             }
         };
     }
-
 }

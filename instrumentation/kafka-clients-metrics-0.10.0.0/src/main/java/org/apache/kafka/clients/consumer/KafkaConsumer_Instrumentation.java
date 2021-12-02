@@ -8,6 +8,7 @@
 package org.apache.kafka.clients.consumer;
 
 import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.metrics.Metrics;
 
 import com.newrelic.agent.bridge.AgentBridge;
@@ -19,6 +20,10 @@ import com.newrelic.api.agent.weaver.Weave;
 import com.newrelic.api.agent.weaver.WeaveAllConstructors;
 import com.newrelic.api.agent.weaver.Weaver;
 import com.nr.instrumentation.kafka.NewRelicMetricsReporter;
+import org.apache.kafka.common.serialization.Deserializer;
+
+import java.util.List;
+import java.util.logging.Level;
 
 @Weave(originalName = "org.apache.kafka.clients.consumer.KafkaConsumer")
 public class KafkaConsumer_Instrumentation<K, V> {
@@ -26,14 +31,28 @@ public class KafkaConsumer_Instrumentation<K, V> {
     private final Metrics metrics = Weaver.callOriginal();
 
     @NewField
+    private NewRelicMetricsReporter newRelicMetricsReporter;
+
+    @NewField
     private boolean initialized;
 
     @WeaveAllConstructors
     public KafkaConsumer_Instrumentation() {
         if (!initialized) {
-            metrics.addReporter(new NewRelicMetricsReporter());
+            metrics.addReporter(newRelicMetricsReporter);
             initialized = true;
         }
+    }
+
+    private ClusterResourceListeners configureClusterResourceListeners(Deserializer<K> keyDeserializer, Deserializer<V> valueDeserializer, List<?>... candidateLists) {
+        // This must be instantiated here because default values for injected fields don't seem to get applied before the constructor,
+        // and the constructor instrumentation happens after this method is called.
+        newRelicMetricsReporter = new NewRelicMetricsReporter();
+
+        AgentBridge.getAgent().getLogger().log(Level.FINEST, "configureClusterResourceListeners()");
+        ClusterResourceListeners clusterResourceListeners = Weaver.callOriginal();
+        clusterResourceListeners.maybeAdd(newRelicMetricsReporter);
+        return clusterResourceListeners;
     }
 
     public ConsumerRecords<K, V> poll(long timeout) {

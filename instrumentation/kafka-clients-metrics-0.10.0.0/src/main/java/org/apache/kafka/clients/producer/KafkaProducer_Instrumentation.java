@@ -18,16 +18,25 @@ import com.newrelic.api.agent.weaver.WeaveAllConstructors;
 import com.newrelic.api.agent.weaver.Weaver;
 import com.nr.instrumentation.kafka.CallbackWrapper;
 import com.nr.instrumentation.kafka.NewRelicMetricsReporter;
+import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.serialization.Serializer;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
+import java.util.logging.Level;
 
 @Weave(originalName = "org.apache.kafka.clients.producer.KafkaProducer")
 public class KafkaProducer_Instrumentation<K, V> {
 
     private final Metrics metrics = Weaver.callOriginal();
+
+    // We need separated instances of this metric reporter for each consumer/producer.
+    // The same instance must be passed to the metrics object, and to the clusterResourceListeners.
+    @NewField
+    private NewRelicMetricsReporter newRelicMetricsReporter;
 
     @NewField
     private boolean initialized;
@@ -35,9 +44,20 @@ public class KafkaProducer_Instrumentation<K, V> {
     @WeaveAllConstructors
     public KafkaProducer_Instrumentation() {
         if (!initialized) {
-            metrics.addReporter(new NewRelicMetricsReporter());
+            metrics.addReporter(newRelicMetricsReporter);
             initialized = true;
         }
+    }
+
+    private ClusterResourceListeners configureClusterResourceListeners(Serializer<K> keySerializer, Serializer<V> valueSerializer, List<?>... candidateLists) {
+        // This must be instantiated here because default values for injected fields don't seem to get applied before the constructor,
+        // and the constructor instrumentation happens after this method is called.
+        newRelicMetricsReporter = new NewRelicMetricsReporter();
+
+        AgentBridge.getAgent().getLogger().log(Level.FINEST, "configureClusterResourceListeners()");
+        ClusterResourceListeners clusterResourceListeners = Weaver.callOriginal();
+        clusterResourceListeners.maybeAdd(newRelicMetricsReporter);
+        return clusterResourceListeners;
     }
 
     @Trace
